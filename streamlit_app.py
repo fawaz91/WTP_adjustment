@@ -306,3 +306,188 @@ st.markdown("""
 - **Pmax_scenario** = conservative scenario price
 - The framework avoids automatic stacking of penalties.
 """)
+import numpy as np
+import pandas as pd
+
+def calculate_icer(delta_cost, delta_qaly):
+    if delta_qaly <= 0:
+        return np.inf
+    return delta_cost / delta_qaly
+
+
+def run_scenario_curves(
+    list_intervention_cost,
+    comparator_cost,
+    scenarios,
+    wtp,
+    discounts=np.arange(0, 0.96, 0.01)
+):
+    rows = []
+
+    for d in discounts:
+        net_intervention_cost = list_intervention_cost * (1 - d)
+
+        for scenario_name, values in scenarios.items():
+            non_drug_cost = values["non_drug_cost"]
+            delta_qaly = values["delta_qaly"]
+
+            total_intervention_cost = net_intervention_cost + non_drug_cost
+            delta_cost = total_intervention_cost - comparator_cost
+            icer = calculate_icer(delta_cost, delta_qaly)
+
+            rows.append({
+                "discount": d,
+                "discount_percent": d * 100,
+                "scenario": scenario_name,
+                "net_intervention_cost": net_intervention_cost,
+                
+                "delta_cost": delta_cost,
+                "delta_qaly": delta_qaly,
+                "icer": icer,
+                "cost_effective": icer <= wtp
+            })
+
+    return pd.DataFrame(rows)
+    wtp = 500_000
+
+list_intervention_cost = 1_000_000
+comparator_cost = 100_000
+
+scenarios = {
+    "Base case": {
+        "delta_qaly": 1.80,
+        "non_drug_cost": 0
+    },
+    "Conservative no-cure scenario": {
+        "delta_qaly": 1.20,
+        "non_drug_cost": 0
+    },
+    "Treatment waning scenario": {
+        "delta_qaly": 1.00,
+        "non_drug_cost": 0
+    },
+    "Optimistic cure scenario": {
+        "delta_qaly": 2.40,
+        "non_drug_cost": 0
+    }
+}
+
+df = run_scenario_curves(
+    list_intervention_cost=list_intervention_cost,
+    comparator_cost=comparator_cost,
+    scenarios=scenarios,
+    wtp=wtp
+)
+
+df.head()
+
+def classify_residual_uncertainty(df, wtp, headroom_required=0.10):
+    summary = []
+
+    for d, group in df.groupby("discount"):
+        min_icer = group["icer"].min()
+        max_icer = group["icer"].max()
+        base_icer = group.loc[group["scenario"] == "Base case", "icer"].iloc[0]
+
+        any_ce = group["cost_effective"].any()
+        all_ce = group["cost_effective"].all()
+        decision_flip = any_ce and not all_ce
+
+        headroom = (wtp - base_icer) / wtp
+
+        if base_icer > wtp:
+            status = "Not cost-effective"
+        elif decision_flip and headroom < headroom_required:
+            status = "Residual uncertainty remains"
+        elif decision_flip and headroom >= headroom_required:
+            status = "Partly covered by price headroom"
+        elif all_ce and headroom >= headroom_required:
+            status = "Uncertainty likely internalised by price"
+        elif all_ce and headroom < headroom_required:
+            status = "Cost-effective but limited headroom"
+        else:
+            status = "Unclear"
+
+        summary.append({
+            "discount": d,
+            "discount_percent": d * 100,
+            "base_icer": base_icer,
+            "min_scenario_icer": min_icer,
+            "max_scenario_icer": max_icer,
+            "decision_flip": decision_flip,
+            "headroom_percent": headroom * 100,
+            "status": status
+        })
+
+    return pd.DataFrame(summary)
+
+
+summary_df = classify_residual_uncertainty(df, wtp, headroom_required=0.10)
+
+summary_df.head()
+
+def find_discount_anchor(summary_df, status_condition):
+    eligible = summary_df[status_condition(summary_df)]
+    if eligible.empty:
+        return None
+    return eligible.sort_values("discount").iloc[0]
+
+
+ordinary_threshold = find_discount_anchor(
+    summary_df,
+    lambda x: x["base_icer"] <= wtp
+)
+
+all_scenarios_threshold = find_discount_anchor(
+    summary_df,
+    lambda x: x["max_scenario_icer"] <= wtp
+)
+
+headroom_threshold = find_discount_anchor(
+    summary_df,
+    lambda x: (x["base_icer"] <= wtp * 0.90)
+)
+
+robust_threshold = find_discount_anchor(
+    summary_df,
+    lambda x: (x["max_scenario_icer"] <= wtp) & (x["headroom_percent"] >= 10)
+)
+
+anchors = {
+    "Ordinary base-case threshold": ordinary_threshold,
+    "All scenarios below WTP": all_scenarios_threshold,
+    "Base case with 10% headroom": headroom_threshold,
+    "Robust threshold": robust_threshold
+}
+
+for name, row in anchors.items():
+    if row is not None:
+        print(name, round(row["discount_percent"], 1), "%")
+    else:
+        print(name, "not reached")
+
+
+import matplotlib.pyplot as plt
+
+def plot_scenario_icer_curves(df, wtp):
+    plt.figure(figsize=(10, 6))
+
+    for scenario in df["scenario"].unique():
+        subset = df[df["scenario"] == scenario]
+        plt.plot(
+            subset["discount_percent"],
+            subset["icer"],
+            label=scenario
+        )
+
+    plt.axhline(wtp, linestyle="--", label=f"WTP = {wtp:,.0f}")
+    plt.xlabel("Discount from list price (%)")
+    plt.ylabel("ICER")
+    plt.title("Scenario ICER curves across discount levels")
+    plt.ylim(0, wtp * 3)
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.show()
+
+
+plot_scenario_icer_curves(df, wtp)
